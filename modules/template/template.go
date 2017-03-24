@@ -9,12 +9,17 @@ import (
 	"encoding/json"
 	"fmt"
 	"html/template"
+	"mime"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
 
+	"github.com/microcosm-cc/bluemonday"
 	"golang.org/x/net/html/charset"
 	"golang.org/x/text/transform"
+	log "gopkg.in/clog.v1"
+	"gopkg.in/editorconfig/editorconfig-core-go.v1"
 
 	"github.com/gogits/gogs/models"
 	"github.com/gogits/gogs/modules/base"
@@ -48,11 +53,15 @@ func NewFuncMap() []template.FuncMap {
 		"DisableGravatar": func() bool {
 			return setting.DisableGravatar
 		},
+		"ShowFooterTemplateLoadTime": func() bool {
+			return setting.ShowFooterTemplateLoadTime
+		},
 		"LoadTimes": func(startTime time.Time) string {
 			return fmt.Sprint(time.Since(startTime).Nanoseconds()/1e6) + "ms"
 		},
 		"AvatarLink":   base.AvatarLink,
 		"Safe":         Safe,
+		"Sanitize":     bluemonday.UGCPolicy().Sanitize,
 		"Str2html":     Str2html,
 		"TimeSince":    base.TimeSince,
 		"RawTimeSince": base.RawTimeSince,
@@ -69,13 +78,6 @@ func NewFuncMap() []template.FuncMap {
 			return t.Format("Jan 02, 2006")
 		},
 		"List": List,
-		"Mail2Domain": func(mail string) string {
-			if !strings.Contains(mail, "@") {
-				return "try.gogs.io"
-			}
-
-			return strings.SplitN(mail, "@", 2)[1]
-		},
 		"SubStr": func(str string, start, length int) string {
 			if len(str) == 0 {
 				return ""
@@ -89,19 +91,31 @@ func NewFuncMap() []template.FuncMap {
 			}
 			return str[start:end]
 		},
+		"Join":              strings.Join,
+		"EllipsisString":    base.EllipsisString,
 		"DiffTypeToStr":     DiffTypeToStr,
 		"DiffLineTypeToStr": DiffLineTypeToStr,
 		"Sha1":              Sha1,
 		"ShortSha":          base.ShortSha,
 		"MD5":               base.EncodeMD5,
 		"ActionContent2Commits": ActionContent2Commits,
-		"ToUtf8":                ToUtf8,
-		"EscapePound": func(str string) string {
-			return strings.Replace(strings.Replace(str, "%", "%25", -1), "#", "%23", -1)
-		},
-		"RenderCommitMessage": RenderCommitMessage,
+		"EscapePound":           EscapePound,
+		"RenderCommitMessage":   RenderCommitMessage,
 		"ThemeColorMetaTag": func() string {
-			return setting.ThemeColorMetaTag
+			return setting.UI.ThemeColorMetaTag
+		},
+		"FilenameIsImage": func(filename string) bool {
+			mimeType := mime.TypeByExtension(filepath.Ext(filename))
+			return strings.HasPrefix(mimeType, "image/")
+		},
+		"TabSizeClass": func(ec *editorconfig.Editorconfig, filename string) string {
+			if ec != nil {
+				def := ec.GetDefinitionForFilename(filename)
+				if def.TabWidth > 0 {
+					return fmt.Sprintf("tab-size-%d", def.TabWidth)
+				}
+			}
+			return "tab-size-8"
 		},
 	}}
 }
@@ -112,10 +126,6 @@ func Safe(raw string) template.HTML {
 
 func Str2html(raw string) template.HTML {
 	return template.HTML(markdown.Sanitizer.Sanitize(raw))
-}
-
-func Range(l int) []int {
-	return make([]int, l)
 }
 
 func List(l *list.List) chan interface{} {
@@ -135,7 +145,7 @@ func Sha1(str string) string {
 	return base.EncodeSha1(str)
 }
 
-func ToUtf8WithErr(content []byte) (error, string) {
+func ToUTF8WithErr(content []byte) (error, string) {
 	charsetLabel, err := base.DetectEncoding(content)
 	if err != nil {
 		return err, ""
@@ -158,8 +168,8 @@ func ToUtf8WithErr(content []byte) (error, string) {
 	return err, result
 }
 
-func ToUtf8(content string) string {
-	_, res := ToUtf8WithErr([]byte(content))
+func ToUTF8(content string) string {
+	_, res := ToUTF8WithErr([]byte(content))
 	return res
 }
 
@@ -216,7 +226,6 @@ func RenderCommitMessage(full bool, msg, urlPrefix string, metas map[string]stri
 type Actioner interface {
 	GetOpType() int
 	GetActUserName() string
-	GetActEmail() string
 	GetRepoUserName() string
 	GetRepoName() string
 	GetRepoPath() string
@@ -233,20 +242,28 @@ func ActionIcon(opType int) string {
 	switch opType {
 	case 1, 8: // Create and transfer repository
 		return "repo"
-	case 5, 9: // Commit repository
+	case 5: // Commit repository
 		return "git-commit"
 	case 6: // Create issue
 		return "issue-opened"
 	case 7: // New pull request
 		return "git-pull-request"
+	case 9: // Push tag
+		return "tag"
 	case 10: // Comment issue
-		return "comment"
+		return "comment-discussion"
 	case 11: // Merge pull request
 		return "git-merge"
 	case 12, 14: // Close issue or pull request
 		return "issue-closed"
 	case 13, 15: // Reopen issue or pull request
 		return "issue-reopened"
+	case 16: // Create branch
+		return "git-branch"
+	case 17, 18: // Delete branch or tag
+		return "alert"
+	case 19: // Fork a repository
+		return "repo-forked"
 	default:
 		return "invalid type"
 	}
@@ -255,9 +272,13 @@ func ActionIcon(opType int) string {
 func ActionContent2Commits(act Actioner) *models.PushCommits {
 	push := models.NewPushCommits()
 	if err := json.Unmarshal([]byte(act.GetContent()), push); err != nil {
-		return nil
+		log.Error(4, "json.Unmarshal:\n%s\nERROR: %v", act.GetContent(), err)
 	}
 	return push
+}
+
+func EscapePound(str string) string {
+	return strings.NewReplacer("%", "%25", "#", "%23", " ", "%20", "?", "%3F").Replace(str)
 }
 
 func DiffTypeToStr(diffType int) string {

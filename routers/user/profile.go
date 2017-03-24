@@ -9,9 +9,12 @@ import (
 	"path"
 	"strings"
 
+	"github.com/Unknwon/paginater"
+
 	"github.com/gogits/gogs/models"
+	"github.com/gogits/gogs/models/errors"
 	"github.com/gogits/gogs/modules/base"
-	"github.com/gogits/gogs/modules/middleware"
+	"github.com/gogits/gogs/modules/context"
 	"github.com/gogits/gogs/modules/setting"
 	"github.com/gogits/gogs/routers/repo"
 )
@@ -21,25 +24,21 @@ const (
 	STARS     base.TplName = "user/meta/stars"
 )
 
-func GetUserByName(ctx *middleware.Context, name string) *models.User {
+func GetUserByName(ctx *context.Context, name string) *models.User {
 	user, err := models.GetUserByName(name)
 	if err != nil {
-		if models.IsErrUserNotExist(err) {
-			ctx.Handle(404, "GetUserByName", nil)
-		} else {
-			ctx.Handle(500, "GetUserByName", err)
-		}
+		ctx.NotFoundOrServerError("GetUserByName", errors.IsUserNotExist, err)
 		return nil
 	}
 	return user
 }
 
 // GetUserByParams returns user whose name is presented in URL paramenter.
-func GetUserByParams(ctx *middleware.Context) *models.User {
+func GetUserByParams(ctx *context.Context) *models.User {
 	return GetUserByName(ctx, ctx.Params(":username"))
 }
 
-func Profile(ctx *middleware.Context) {
+func Profile(ctx *context.Context) {
 	uname := ctx.Params(":username")
 	// Special handle for FireFox requests favicon.ico.
 	if uname == "favicon.ico" {
@@ -55,27 +54,27 @@ func Profile(ctx *middleware.Context) {
 		isShowKeys = true
 	}
 
-	u := GetUserByName(ctx, strings.TrimSuffix(uname, ".keys"))
+	ctxUser := GetUserByName(ctx, strings.TrimSuffix(uname, ".keys"))
 	if ctx.Written() {
 		return
 	}
 
 	// Show SSH keys.
 	if isShowKeys {
-		ShowSSHKeys(ctx, u.Id)
+		ShowSSHKeys(ctx, ctxUser.ID)
 		return
 	}
 
-	if u.IsOrganization() {
+	if ctxUser.IsOrganization() {
 		showOrgProfile(ctx)
 		return
 	}
 
-	ctx.Data["Title"] = u.DisplayName()
+	ctx.Data["Title"] = ctxUser.DisplayName()
 	ctx.Data["PageIsUserProfile"] = true
-	ctx.Data["Owner"] = u
+	ctx.Data["Owner"] = ctxUser
 
-	orgs, err := models.GetOrgsByUserID(u.Id, ctx.IsSigned && (ctx.User.IsAdmin || ctx.User.Id == u.Id))
+	orgs, err := models.GetOrgsByUserID(ctxUser.ID, ctx.IsSigned && (ctx.User.IsAdmin || ctx.User.ID == ctxUser.ID))
 	if err != nil {
 		ctx.Handle(500, "GetOrgsByUserIDDesc", err)
 		return
@@ -87,23 +86,36 @@ func Profile(ctx *middleware.Context) {
 	ctx.Data["TabName"] = tab
 	switch tab {
 	case "activity":
-		retrieveFeeds(ctx, u.Id, -1, 0, true)
+		retrieveFeeds(ctx, ctxUser, -1, true)
 		if ctx.Written() {
 			return
 		}
 	default:
-		var err error
-		ctx.Data["Repos"], err = models.GetRepositories(u.Id, ctx.IsSigned && ctx.User.Id == u.Id)
+		page := ctx.QueryInt("page")
+		if page <= 0 {
+			page = 1
+		}
+
+		showPrivate := ctx.IsSigned && (ctxUser.ID == ctx.User.ID || ctx.User.IsAdmin)
+		ctx.Data["Repos"], err = models.GetUserRepositories(&models.UserRepoOptions{
+			UserID:   ctxUser.ID,
+			Private:  showPrivate,
+			Page:     page,
+			PageSize: setting.UI.User.RepoPagingNum,
+		})
 		if err != nil {
 			ctx.Handle(500, "GetRepositories", err)
 			return
 		}
+
+		count := models.CountUserRepositories(ctxUser.ID, showPrivate)
+		ctx.Data["Page"] = paginater.New(int(count), setting.UI.User.RepoPagingNum, page, 5)
 	}
 
 	ctx.HTML(200, PROFILE)
 }
 
-func Followers(ctx *middleware.Context) {
+func Followers(ctx *context.Context) {
 	u := GetUserByParams(ctx)
 	if ctx.Written() {
 		return
@@ -115,7 +127,7 @@ func Followers(ctx *middleware.Context) {
 	repo.RenderUserCards(ctx, u.NumFollowers, u.GetFollowers, FOLLOWERS)
 }
 
-func Following(ctx *middleware.Context) {
+func Following(ctx *context.Context) {
 	u := GetUserByParams(ctx)
 	if ctx.Written() {
 		return
@@ -127,11 +139,11 @@ func Following(ctx *middleware.Context) {
 	repo.RenderUserCards(ctx, u.NumFollowing, u.GetFollowing, FOLLOWERS)
 }
 
-func Stars(ctx *middleware.Context) {
+func Stars(ctx *context.Context) {
 
 }
 
-func Action(ctx *middleware.Context) {
+func Action(ctx *context.Context) {
 	u := GetUserByParams(ctx)
 	if ctx.Written() {
 		return
@@ -140,9 +152,9 @@ func Action(ctx *middleware.Context) {
 	var err error
 	switch ctx.Params(":action") {
 	case "follow":
-		err = models.FollowUser(ctx.User.Id, u.Id)
+		err = models.FollowUser(ctx.User.ID, u.ID)
 	case "unfollow":
-		err = models.UnfollowUser(ctx.User.Id, u.Id)
+		err = models.UnfollowUser(ctx.User.ID, u.ID)
 	}
 
 	if err != nil {

@@ -5,11 +5,12 @@
 package org
 
 import (
+	log "gopkg.in/clog.v1"
+
 	"github.com/gogits/gogs/models"
-	"github.com/gogits/gogs/modules/auth"
+	"github.com/gogits/gogs/modules/form"
 	"github.com/gogits/gogs/modules/base"
-	"github.com/gogits/gogs/modules/log"
-	"github.com/gogits/gogs/modules/middleware"
+	"github.com/gogits/gogs/modules/context"
 	"github.com/gogits/gogs/modules/setting"
 )
 
@@ -17,12 +18,12 @@ const (
 	CREATE base.TplName = "org/create"
 )
 
-func Create(ctx *middleware.Context) {
+func Create(ctx *context.Context) {
 	ctx.Data["Title"] = ctx.Tr("new_org")
 	ctx.HTML(200, CREATE)
 }
 
-func CreatePost(ctx *middleware.Context, form auth.CreateOrgForm) {
+func CreatePost(ctx *context.Context, f form.CreateOrg) {
 	ctx.Data["Title"] = ctx.Tr("new_org")
 
 	if ctx.HasError() {
@@ -31,20 +32,20 @@ func CreatePost(ctx *middleware.Context, form auth.CreateOrgForm) {
 	}
 
 	org := &models.User{
-		Name:     form.OrgName,
+		Name:     f.OrgName,
 		IsActive: true,
-		Type:     models.ORGANIZATION,
+		Type:     models.USER_TYPE_ORGANIZATION,
 	}
 
 	if err := models.CreateOrganization(org, ctx.User); err != nil {
 		ctx.Data["Err_OrgName"] = true
 		switch {
 		case models.IsErrUserAlreadyExist(err):
-			ctx.RenderWithErr(ctx.Tr("form.org_name_been_taken"), CREATE, &form)
+			ctx.RenderWithErr(ctx.Tr("form.org_name_been_taken"), CREATE, &f)
 		case models.IsErrNameReserved(err):
-			ctx.RenderWithErr(ctx.Tr("org.form.name_reserved", err.(models.ErrNameReserved).Name), CREATE, &form)
+			ctx.RenderWithErr(ctx.Tr("org.form.name_reserved", err.(models.ErrNameReserved).Name), CREATE, &f)
 		case models.IsErrNamePatternNotAllowed(err):
-			ctx.RenderWithErr(ctx.Tr("org.form.name_pattern_not_allowed", err.(models.ErrNamePatternNotAllowed).Pattern), CREATE, &form)
+			ctx.RenderWithErr(ctx.Tr("org.form.name_pattern_not_allowed", err.(models.ErrNamePatternNotAllowed).Pattern), CREATE, &f)
 		default:
 			ctx.Handle(500, "CreateOrganization", err)
 		}
@@ -52,5 +53,5 @@ func CreatePost(ctx *middleware.Context, form auth.CreateOrgForm) {
 	}
 	log.Trace("Organization created: %s", org.Name)
 
-	ctx.Redirect(setting.AppSubUrl + "/org/" + form.OrgName + "/dashboard")
+	ctx.Redirect(setting.AppSubUrl + "/org/" + f.OrgName + "/dashboard")
 }

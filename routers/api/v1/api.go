@@ -13,8 +13,9 @@ import (
 	api "github.com/gogits/go-gogs-client"
 
 	"github.com/gogits/gogs/models"
-	"github.com/gogits/gogs/modules/auth"
-	"github.com/gogits/gogs/modules/middleware"
+	"github.com/gogits/gogs/models/errors"
+	"github.com/gogits/gogs/modules/context"
+	"github.com/gogits/gogs/modules/form"
 	"github.com/gogits/gogs/routers/api/v1/admin"
 	"github.com/gogits/gogs/routers/api/v1/misc"
 	"github.com/gogits/gogs/routers/api/v1/org"
@@ -22,8 +23,8 @@ import (
 	"github.com/gogits/gogs/routers/api/v1/user"
 )
 
-func RepoAssignment() macaron.Handler {
-	return func(ctx *middleware.Context) {
+func repoAssignment() macaron.Handler {
+	return func(ctx *context.APIContext) {
 		userName := ctx.Params(":username")
 		repoName := ctx.Params(":reponame")
 
@@ -38,10 +39,10 @@ func RepoAssignment() macaron.Handler {
 		} else {
 			owner, err = models.GetUserByName(userName)
 			if err != nil {
-				if models.IsErrUserNotExist(err) {
-					ctx.Error(404)
+				if errors.IsUserNotExist(err) {
+					ctx.Status(404)
 				} else {
-					ctx.APIError(500, "GetUserByName", err)
+					ctx.Error(500, "GetUserByName", err)
 				}
 				return
 			}
@@ -49,30 +50,32 @@ func RepoAssignment() macaron.Handler {
 		ctx.Repo.Owner = owner
 
 		// Get repository.
-		repo, err := models.GetRepositoryByName(owner.Id, repoName)
+		repo, err := models.GetRepositoryByName(owner.ID, repoName)
 		if err != nil {
-			if models.IsErrRepoNotExist(err) {
-				ctx.Error(404)
+			if errors.IsRepoNotExist(err) {
+				ctx.Status(404)
 			} else {
-				ctx.APIError(500, "GetRepositoryByName", err)
+				ctx.Error(500, "GetRepositoryByName", err)
 			}
 			return
 		} else if err = repo.GetOwner(); err != nil {
-			ctx.APIError(500, "GetOwner", err)
+			ctx.Error(500, "GetOwner", err)
 			return
 		}
 
-		mode, err := models.AccessLevel(ctx.User, repo)
-		if err != nil {
-			ctx.APIError(500, "AccessLevel", err)
-			return
+		if ctx.IsSigned && ctx.User.IsAdmin {
+			ctx.Repo.AccessMode = models.ACCESS_MODE_OWNER
+		} else {
+			mode, err := models.AccessLevel(ctx.User.ID, repo)
+			if err != nil {
+				ctx.Error(500, "AccessLevel", err)
+				return
+			}
+			ctx.Repo.AccessMode = mode
 		}
 
-		ctx.Repo.AccessMode = mode
-
-		// Check access.
-		if ctx.Repo.AccessMode == models.ACCESS_MODE_NONE {
-			ctx.Error(404)
+		if !ctx.Repo.HasAccess() {
+			ctx.Status(404)
 			return
 		}
 
@@ -81,8 +84,8 @@ func RepoAssignment() macaron.Handler {
 }
 
 // Contexter middleware already checks token for user sign in process.
-func ReqToken() macaron.Handler {
-	return func(ctx *middleware.Context) {
+func reqToken() macaron.Handler {
+	return func(ctx *context.Context) {
 		if !ctx.IsSigned {
 			ctx.Error(401)
 			return
@@ -90,8 +93,8 @@ func ReqToken() macaron.Handler {
 	}
 }
 
-func ReqBasicAuth() macaron.Handler {
-	return func(ctx *middleware.Context) {
+func reqBasicAuth() macaron.Handler {
+	return func(ctx *context.Context) {
 		if !ctx.IsBasicAuth {
 			ctx.Error(401)
 			return
@@ -99,12 +102,69 @@ func ReqBasicAuth() macaron.Handler {
 	}
 }
 
-func ReqAdmin() macaron.Handler {
-	return func(ctx *middleware.Context) {
-		if !ctx.User.IsAdmin {
+func reqAdmin() macaron.Handler {
+	return func(ctx *context.Context) {
+		if !ctx.IsSigned || !ctx.User.IsAdmin {
 			ctx.Error(403)
 			return
 		}
+	}
+}
+
+func reqRepoWriter() macaron.Handler {
+	return func(ctx *context.Context) {
+		if !ctx.Repo.IsWriter() {
+			ctx.Error(403)
+			return
+		}
+	}
+}
+
+func orgAssignment(args ...bool) macaron.Handler {
+	var (
+		assignOrg  bool
+		assignTeam bool
+	)
+	if len(args) > 0 {
+		assignOrg = args[0]
+	}
+	if len(args) > 1 {
+		assignTeam = args[1]
+	}
+	return func(ctx *context.APIContext) {
+		ctx.Org = new(context.APIOrganization)
+
+		var err error
+		if assignOrg {
+			ctx.Org.Organization, err = models.GetUserByName(ctx.Params(":orgname"))
+			if err != nil {
+				if errors.IsUserNotExist(err) {
+					ctx.Status(404)
+				} else {
+					ctx.Error(500, "GetUserByName", err)
+				}
+				return
+			}
+		}
+
+		if assignTeam {
+			ctx.Org.Team, err = models.GetTeamByID(ctx.ParamsInt64(":teamid"))
+			if err != nil {
+				if errors.IsUserNotExist(err) {
+					ctx.Status(404)
+				} else {
+					ctx.Error(500, "GetTeamById", err)
+				}
+				return
+			}
+		}
+	}
+}
+
+func mustEnableIssues(ctx *context.APIContext) {
+	if !ctx.Repo.Repository.EnableIssues || ctx.Repo.Repository.EnableExternalTracker {
+		ctx.Status(404)
+		return
 	}
 }
 
@@ -114,6 +174,9 @@ func RegisterRoutes(m *macaron.Macaron) {
 	bind := binding.Bind
 
 	m.Group("/v1", func() {
+		// Handle preflight OPTIONS request
+		m.Options("/*", func() {})
+
 		// Miscellaneous
 		m.Post("/markdown", bind(api.MarkdownOption{}), misc.Markdown)
 		m.Post("/markdown/raw", misc.MarkdownRaw)
@@ -128,7 +191,7 @@ func RegisterRoutes(m *macaron.Macaron) {
 				m.Group("/tokens", func() {
 					m.Combo("").Get(user.ListAccessTokens).
 						Post(bind(api.CreateAccessTokenOption{}), user.CreateAccessToken)
-				}, ReqBasicAuth())
+				}, reqBasicAuth())
 			})
 		})
 
@@ -142,9 +205,10 @@ func RegisterRoutes(m *macaron.Macaron) {
 					m.Get("/:target", user.CheckFollowing)
 				})
 			})
-		}, ReqToken())
+		}, reqToken())
 
 		m.Group("/user", func() {
+			m.Get("", user.GetAuthenticatedUser)
 			m.Combo("/emails").Get(user.ListEmails).
 				Post(bind(api.CreateEmailOption{}), user.AddEmail).
 				Delete(bind(api.CreateEmailOption{}), user.DeleteEmail)
@@ -161,31 +225,44 @@ func RegisterRoutes(m *macaron.Macaron) {
 				m.Combo("/:id").Get(user.GetPublicKey).
 					Delete(user.DeletePublicKey)
 			})
-		}, ReqToken())
+
+			m.Combo("/issues").Get(repo.ListUserIssues)
+		}, reqToken())
 
 		// Repositories
-		m.Combo("/user/repos", ReqToken()).Get(repo.ListMyRepos).
+		m.Get("/users/:username/repos", reqToken(), repo.ListUserRepositories)
+		m.Get("/orgs/:org/repos", reqToken(), repo.ListOrgRepositories)
+		m.Combo("/user/repos", reqToken()).Get(repo.ListMyRepos).
 			Post(bind(api.CreateRepoOption{}), repo.Create)
-		m.Post("/org/:org/repos", ReqToken(), bind(api.CreateRepoOption{}), repo.CreateOrgRepo)
+		m.Post("/org/:org/repos", reqToken(), bind(api.CreateRepoOption{}), repo.CreateOrgRepo)
 
 		m.Group("/repos", func() {
 			m.Get("/search", repo.Search)
 		})
 
 		m.Group("/repos", func() {
-			m.Post("/migrate", bind(auth.MigrateRepoForm{}), repo.Migrate)
-			m.Combo("/:username/:reponame").Get(repo.Get).
+			m.Post("/migrate", bind(form.MigrateRepo{}), repo.Migrate)
+			m.Combo("/:username/:reponame", repoAssignment()).Get(repo.Get).
 				Delete(repo.Delete)
 
 			m.Group("/:username/:reponame", func() {
-				m.Combo("/hooks").Get(repo.ListHooks).
-					Post(bind(api.CreateHookOption{}), repo.CreateHook)
-				m.Patch("/hooks/:id:int", bind(api.EditHookOption{}), repo.EditHook)
-				m.Get("/raw/*", middleware.RepoRef(), repo.GetRawFile)
+				m.Group("/hooks", func() {
+					m.Combo("").Get(repo.ListHooks).
+						Post(bind(api.CreateHookOption{}), repo.CreateHook)
+					m.Combo("/:id").Patch(bind(api.EditHookOption{}), repo.EditHook).
+						Delete(repo.DeleteHook)
+				})
+				m.Group("/collaborators", func() {
+					m.Get("", repo.ListCollaborators)
+					m.Combo("/:collaborator").Get(repo.IsCollaborator).Put(bind(api.AddCollaboratorOption{}), repo.AddCollaborator).
+						Delete(repo.DeleteCollaborator)
+				})
+				m.Get("/raw/*", context.RepoRef(), repo.GetRawFile)
 				m.Get("/archive/*", repo.GetArchive)
+				m.Get("/forks", repo.ListForks)
 				m.Group("/branches", func() {
-					m.Get("",repo.ListBranches)
-					m.Get("/:branchname",repo.GetBranch)
+					m.Get("", repo.ListBranches)
+					m.Get("/*", repo.GetBranch)
 				})
 				m.Group("/keys", func() {
 					m.Combo("").Get(repo.ListDeployKeys).
@@ -193,15 +270,59 @@ func RegisterRoutes(m *macaron.Macaron) {
 					m.Combo("/:id").Get(repo.GetDeployKey).
 						Delete(repo.DeleteDeploykey)
 				})
-			}, RepoAssignment())
-		}, ReqToken())
+				m.Group("/issues", func() {
+					m.Combo("").Get(repo.ListIssues).Post(bind(api.CreateIssueOption{}), repo.CreateIssue)
+					m.Group("/comments", func() {
+						m.Get("", repo.ListRepoIssueComments)
+						m.Combo("/:id").Patch(bind(api.EditIssueCommentOption{}), repo.EditIssueComment)
+					})
+					m.Group("/:index", func() {
+						m.Combo("").Get(repo.GetIssue).Patch(bind(api.EditIssueOption{}), repo.EditIssue)
+
+						m.Group("/comments", func() {
+							m.Combo("").Get(repo.ListIssueComments).Post(bind(api.CreateIssueCommentOption{}), repo.CreateIssueComment)
+							m.Combo("/:id").Patch(bind(api.EditIssueCommentOption{}), repo.EditIssueComment).
+								Delete(repo.DeleteIssueComment)
+						})
+
+						m.Group("/labels", func() {
+							m.Combo("").Get(repo.ListIssueLabels).
+								Post(bind(api.IssueLabelsOption{}), repo.AddIssueLabels).
+								Put(bind(api.IssueLabelsOption{}), repo.ReplaceIssueLabels).
+								Delete(repo.ClearIssueLabels)
+							m.Delete("/:id", repo.DeleteIssueLabel)
+						})
+
+					})
+				}, mustEnableIssues)
+				m.Group("/labels", func() {
+					m.Combo("").Get(repo.ListLabels).
+						Post(bind(api.CreateLabelOption{}), repo.CreateLabel)
+					m.Combo("/:id").Get(repo.GetLabel).Patch(bind(api.EditLabelOption{}), repo.EditLabel).
+						Delete(repo.DeleteLabel)
+				})
+				m.Group("/milestones", func() {
+					m.Combo("").Get(repo.ListMilestones).
+						Post(reqRepoWriter(), bind(api.CreateMilestoneOption{}), repo.CreateMilestone)
+					m.Combo("/:id").Get(repo.GetMilestone).
+						Patch(reqRepoWriter(), bind(api.EditMilestoneOption{}), repo.EditMilestone).
+						Delete(reqRepoWriter(), repo.DeleteMilestone)
+				})
+				m.Get("/editorconfig/:filename", context.RepoRef(), repo.GetEditorconfig)
+			}, repoAssignment())
+		}, reqToken())
+
+		m.Get("/issues", reqToken(), repo.ListUserIssues)
 
 		// Organizations
-		m.Get("/user/orgs", ReqToken(), org.ListMyOrgs)
+		m.Get("/user/orgs", reqToken(), org.ListMyOrgs)
 		m.Get("/users/:username/orgs", org.ListUserOrgs)
-		m.Combo("/orgs/:orgname").Get(org.Get).Patch(bind(api.EditOrgOption{}), org.Edit)
+		m.Group("/orgs/:orgname", func() {
+			m.Combo("").Get(org.Get).Patch(bind(api.EditOrgOption{}), org.Edit)
+			m.Combo("/teams").Get(org.ListTeams)
+		}, orgAssignment(true))
 
-		m.Any("/*", func(ctx *middleware.Context) {
+		m.Any("/*", func(ctx *context.Context) {
 			ctx.Error(404)
 		})
 
@@ -217,6 +338,18 @@ func RegisterRoutes(m *macaron.Macaron) {
 					m.Post("/repos", bind(api.CreateRepoOption{}), admin.CreateRepo)
 				})
 			})
-		}, ReqAdmin())
-	})
+
+			m.Group("/orgs/:orgname", func() {
+				m.Group("/teams", func() {
+					m.Post("", orgAssignment(true), bind(api.CreateTeamOption{}), admin.CreateTeam)
+				})
+			})
+			m.Group("/teams", func() {
+				m.Group("/:teamid", func() {
+					m.Combo("/members/:username").Put(admin.AddTeamMember).Delete(admin.RemoveTeamMember)
+					m.Combo("/repos/:reponame").Put(admin.AddTeamRepository).Delete(admin.RemoveTeamRepository)
+				}, orgAssignment(false, true))
+			})
+		}, reqAdmin())
+	}, context.APIContexter())
 }

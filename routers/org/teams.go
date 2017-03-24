@@ -8,12 +8,13 @@ import (
 	"path"
 
 	"github.com/Unknwon/com"
+	log "gopkg.in/clog.v1"
 
 	"github.com/gogits/gogs/models"
-	"github.com/gogits/gogs/modules/auth"
+	"github.com/gogits/gogs/models/errors"
 	"github.com/gogits/gogs/modules/base"
-	"github.com/gogits/gogs/modules/log"
-	"github.com/gogits/gogs/modules/middleware"
+	"github.com/gogits/gogs/modules/context"
+	"github.com/gogits/gogs/modules/form"
 )
 
 const (
@@ -23,7 +24,7 @@ const (
 	TEAM_REPOSITORIES base.TplName = "org/team/repositories"
 )
 
-func Teams(ctx *middleware.Context) {
+func Teams(ctx *context.Context) {
 	org := ctx.Org.Organization
 	ctx.Data["Title"] = org.FullName
 	ctx.Data["PageIsOrgTeams"] = true
@@ -39,7 +40,7 @@ func Teams(ctx *middleware.Context) {
 	ctx.HTML(200, TEAMS)
 }
 
-func TeamsAction(ctx *middleware.Context) {
+func TeamsAction(ctx *context.Context) {
 	uid := com.StrTo(ctx.Query("uid")).MustInt64()
 	if uid == 0 {
 		ctx.Redirect(ctx.Org.OrgLink + "/teams")
@@ -54,9 +55,9 @@ func TeamsAction(ctx *middleware.Context) {
 			ctx.Error(404)
 			return
 		}
-		err = ctx.Org.Team.AddMember(ctx.User.Id)
+		err = ctx.Org.Team.AddMember(ctx.User.ID)
 	case "leave":
-		err = ctx.Org.Team.RemoveMember(ctx.User.Id)
+		err = ctx.Org.Team.RemoveMember(ctx.User.ID)
 	case "remove":
 		if !ctx.Org.IsOwner {
 			ctx.Error(404)
@@ -73,7 +74,7 @@ func TeamsAction(ctx *middleware.Context) {
 		var u *models.User
 		u, err = models.GetUserByName(uname)
 		if err != nil {
-			if models.IsErrUserNotExist(err) {
+			if errors.IsUserNotExist(err) {
 				ctx.Flash.Error(ctx.Tr("form.user_not_exist"))
 				ctx.Redirect(ctx.Org.OrgLink + "/teams/" + ctx.Org.Team.LowerName)
 			} else {
@@ -82,7 +83,7 @@ func TeamsAction(ctx *middleware.Context) {
 			return
 		}
 
-		err = ctx.Org.Team.AddMember(u.Id)
+		err = ctx.Org.Team.AddMember(u.ID)
 		page = "team"
 	}
 
@@ -107,7 +108,7 @@ func TeamsAction(ctx *middleware.Context) {
 	}
 }
 
-func TeamsRepoAction(ctx *middleware.Context) {
+func TeamsRepoAction(ctx *context.Context) {
 	if !ctx.Org.IsOwner {
 		ctx.Error(404)
 		return
@@ -118,9 +119,9 @@ func TeamsRepoAction(ctx *middleware.Context) {
 	case "add":
 		repoName := path.Base(ctx.Query("repo_name"))
 		var repo *models.Repository
-		repo, err = models.GetRepositoryByName(ctx.Org.Organization.Id, repoName)
+		repo, err = models.GetRepositoryByName(ctx.Org.Organization.ID, repoName)
 		if err != nil {
-			if models.IsErrRepoNotExist(err) {
+			if errors.IsRepoNotExist(err) {
 				ctx.Flash.Error(ctx.Tr("org.teams.add_nonexistent_repo"))
 				ctx.Redirect(ctx.Org.OrgLink + "/teams/" + ctx.Org.Team.LowerName + "/repositories")
 				return
@@ -141,7 +142,7 @@ func TeamsRepoAction(ctx *middleware.Context) {
 	ctx.Redirect(ctx.Org.OrgLink + "/teams/" + ctx.Org.Team.LowerName + "/repositories")
 }
 
-func NewTeam(ctx *middleware.Context) {
+func NewTeam(ctx *context.Context) {
 	ctx.Data["Title"] = ctx.Org.Organization.FullName
 	ctx.Data["PageIsOrgTeams"] = true
 	ctx.Data["PageIsOrgTeamsNew"] = true
@@ -149,30 +150,16 @@ func NewTeam(ctx *middleware.Context) {
 	ctx.HTML(200, TEAM_NEW)
 }
 
-func NewTeamPost(ctx *middleware.Context, form auth.CreateTeamForm) {
+func NewTeamPost(ctx *context.Context, f form.CreateTeam) {
 	ctx.Data["Title"] = ctx.Org.Organization.FullName
 	ctx.Data["PageIsOrgTeams"] = true
 	ctx.Data["PageIsOrgTeamsNew"] = true
 
-	// Validate permission level.
-	var auth models.AccessMode
-	switch form.Permission {
-	case "read":
-		auth = models.ACCESS_MODE_READ
-	case "write":
-		auth = models.ACCESS_MODE_WRITE
-	case "admin":
-		auth = models.ACCESS_MODE_ADMIN
-	default:
-		ctx.Error(401)
-		return
-	}
-
 	t := &models.Team{
-		OrgID:       ctx.Org.Organization.Id,
-		Name:        form.TeamName,
-		Description: form.Description,
-		Authorize:   auth,
+		OrgID:       ctx.Org.Organization.ID,
+		Name:        f.TeamName,
+		Description: f.Description,
+		Authorize:   models.ParseAccessMode(f.Permission),
 	}
 	ctx.Data["Team"] = t
 
@@ -185,7 +172,9 @@ func NewTeamPost(ctx *middleware.Context, form auth.CreateTeamForm) {
 		ctx.Data["Err_TeamName"] = true
 		switch {
 		case models.IsErrTeamAlreadyExist(err):
-			ctx.RenderWithErr(ctx.Tr("form.team_name_been_taken"), TEAM_NEW, &form)
+			ctx.RenderWithErr(ctx.Tr("form.team_name_been_taken"), TEAM_NEW, &f)
+		case models.IsErrNameReserved(err):
+			ctx.RenderWithErr(ctx.Tr("org.form.team_name_reserved", err.(models.ErrNameReserved).Name), TEAM_NEW, &f)
 		default:
 			ctx.Handle(500, "NewTeam", err)
 		}
@@ -195,7 +184,7 @@ func NewTeamPost(ctx *middleware.Context, form auth.CreateTeamForm) {
 	ctx.Redirect(ctx.Org.OrgLink + "/teams/" + t.LowerName)
 }
 
-func TeamMembers(ctx *middleware.Context) {
+func TeamMembers(ctx *context.Context) {
 	ctx.Data["Title"] = ctx.Org.Team.Name
 	ctx.Data["PageIsOrgTeams"] = true
 	if err := ctx.Org.Team.GetMembers(); err != nil {
@@ -205,7 +194,7 @@ func TeamMembers(ctx *middleware.Context) {
 	ctx.HTML(200, TEAM_MEMBERS)
 }
 
-func TeamRepositories(ctx *middleware.Context) {
+func TeamRepositories(ctx *context.Context) {
 	ctx.Data["Title"] = ctx.Org.Team.Name
 	ctx.Data["PageIsOrgTeams"] = true
 	if err := ctx.Org.Team.GetRepositories(); err != nil {
@@ -215,7 +204,7 @@ func TeamRepositories(ctx *middleware.Context) {
 	ctx.HTML(200, TEAM_REPOSITORIES)
 }
 
-func EditTeam(ctx *middleware.Context) {
+func EditTeam(ctx *context.Context) {
 	ctx.Data["Title"] = ctx.Org.Organization.FullName
 	ctx.Data["PageIsOrgTeams"] = true
 	ctx.Data["team_name"] = ctx.Org.Team.Name
@@ -223,7 +212,7 @@ func EditTeam(ctx *middleware.Context) {
 	ctx.HTML(200, TEAM_NEW)
 }
 
-func EditTeamPost(ctx *middleware.Context, form auth.CreateTeamForm) {
+func EditTeamPost(ctx *context.Context, f form.CreateTeam) {
 	t := ctx.Org.Team
 	ctx.Data["Title"] = ctx.Org.Organization.FullName
 	ctx.Data["PageIsOrgTeams"] = true
@@ -238,7 +227,7 @@ func EditTeamPost(ctx *middleware.Context, form auth.CreateTeamForm) {
 	if !t.IsOwnerTeam() {
 		// Validate permission level.
 		var auth models.AccessMode
-		switch form.Permission {
+		switch f.Permission {
 		case "read":
 			auth = models.ACCESS_MODE_READ
 		case "write":
@@ -250,18 +239,18 @@ func EditTeamPost(ctx *middleware.Context, form auth.CreateTeamForm) {
 			return
 		}
 
-		t.Name = form.TeamName
+		t.Name = f.TeamName
 		if t.Authorize != auth {
 			isAuthChanged = true
 			t.Authorize = auth
 		}
 	}
-	t.Description = form.Description
+	t.Description = f.Description
 	if err := models.UpdateTeam(t, isAuthChanged); err != nil {
 		ctx.Data["Err_TeamName"] = true
 		switch {
 		case models.IsErrTeamAlreadyExist(err):
-			ctx.RenderWithErr(ctx.Tr("form.team_name_been_taken"), TEAM_NEW, &form)
+			ctx.RenderWithErr(ctx.Tr("form.team_name_been_taken"), TEAM_NEW, &f)
 		default:
 			ctx.Handle(500, "UpdateTeam", err)
 		}
@@ -270,7 +259,7 @@ func EditTeamPost(ctx *middleware.Context, form auth.CreateTeamForm) {
 	ctx.Redirect(ctx.Org.OrgLink + "/teams/" + t.LowerName)
 }
 
-func DeleteTeam(ctx *middleware.Context) {
+func DeleteTeam(ctx *context.Context) {
 	if err := models.DeleteTeam(ctx.Org.Team); err != nil {
 		ctx.Flash.Error("DeleteTeam: " + err.Error())
 	} else {

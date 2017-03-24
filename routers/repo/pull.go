@@ -10,14 +10,15 @@ import (
 	"strings"
 
 	"github.com/Unknwon/com"
+	log "gopkg.in/clog.v1"
 
 	"github.com/gogits/git-module"
 
 	"github.com/gogits/gogs/models"
-	"github.com/gogits/gogs/modules/auth"
+	"github.com/gogits/gogs/models/errors"
 	"github.com/gogits/gogs/modules/base"
-	"github.com/gogits/gogs/modules/log"
-	"github.com/gogits/gogs/modules/middleware"
+	"github.com/gogits/gogs/modules/context"
+	"github.com/gogits/gogs/modules/form"
 	"github.com/gogits/gogs/modules/setting"
 )
 
@@ -38,31 +39,27 @@ var (
 	}
 )
 
-func getForkRepository(ctx *middleware.Context) *models.Repository {
-	forkRepo, err := models.GetRepositoryByID(ctx.ParamsInt64(":repoid"))
+func parseBaseRepository(ctx *context.Context) *models.Repository {
+	baseRepo, err := models.GetRepositoryByID(ctx.ParamsInt64(":repoid"))
 	if err != nil {
-		if models.IsErrRepoNotExist(err) {
-			ctx.Handle(404, "GetRepositoryByID", nil)
-		} else {
-			ctx.Handle(500, "GetRepositoryByID", err)
-		}
+		ctx.NotFoundOrServerError("GetRepositoryByID", errors.IsRepoNotExist, err)
 		return nil
 	}
 
-	if !forkRepo.CanBeForked() {
-		ctx.Handle(404, "getForkRepository", nil)
+	if !baseRepo.CanBeForked() || !baseRepo.HasAccess(ctx.User.ID) {
+		ctx.NotFound()
 		return nil
 	}
 
-	ctx.Data["repo_name"] = forkRepo.Name
-	ctx.Data["description"] = forkRepo.Description
-	ctx.Data["IsPrivate"] = forkRepo.IsPrivate
+	ctx.Data["repo_name"] = baseRepo.Name
+	ctx.Data["description"] = baseRepo.Description
+	ctx.Data["IsPrivate"] = baseRepo.IsPrivate
 
-	if err = forkRepo.GetOwner(); err != nil {
+	if err = baseRepo.GetOwner(); err != nil {
 		ctx.Handle(500, "GetOwner", err)
 		return nil
 	}
-	ctx.Data["ForkFrom"] = forkRepo.Owner.Name + "/" + forkRepo.Name
+	ctx.Data["ForkFrom"] = baseRepo.Owner.Name + "/" + baseRepo.Name
 
 	if err := ctx.User.GetOrganizations(true); err != nil {
 		ctx.Handle(500, "GetOrganizations", err)
@@ -70,13 +67,13 @@ func getForkRepository(ctx *middleware.Context) *models.Repository {
 	}
 	ctx.Data["Orgs"] = ctx.User.Orgs
 
-	return forkRepo
+	return baseRepo
 }
 
-func Fork(ctx *middleware.Context) {
+func Fork(ctx *context.Context) {
 	ctx.Data["Title"] = ctx.Tr("new_fork")
 
-	getForkRepository(ctx)
+	parseBaseRepository(ctx)
 	if ctx.Written() {
 		return
 	}
@@ -85,15 +82,15 @@ func Fork(ctx *middleware.Context) {
 	ctx.HTML(200, FORK)
 }
 
-func ForkPost(ctx *middleware.Context, form auth.CreateRepoForm) {
+func ForkPost(ctx *context.Context, f form.CreateRepo) {
 	ctx.Data["Title"] = ctx.Tr("new_fork")
 
-	forkRepo := getForkRepository(ctx)
+	baseRepo := parseBaseRepository(ctx)
 	if ctx.Written() {
 		return
 	}
 
-	ctxUser := checkContextUser(ctx, form.Uid)
+	ctxUser := checkContextUser(ctx, f.UserID)
 	if ctx.Written() {
 		return
 	}
@@ -104,51 +101,51 @@ func ForkPost(ctx *middleware.Context, form auth.CreateRepoForm) {
 		return
 	}
 
-	repo, has := models.HasForkedRepo(ctxUser.Id, forkRepo.ID)
+	repo, has := models.HasForkedRepo(ctxUser.ID, baseRepo.ID)
 	if has {
-		ctx.Redirect(setting.AppSubUrl + "/" + ctxUser.Name + "/" + repo.Name)
+		ctx.Redirect(repo.Link())
 		return
 	}
 
 	// Check ownership of organization.
-	if ctxUser.IsOrganization() {
-		if !ctxUser.IsOwnedBy(ctx.User.Id) {
-			ctx.Error(403)
-			return
-		}
+	if ctxUser.IsOrganization() && !ctxUser.IsOwnedBy(ctx.User.ID) {
+		ctx.Error(403)
+		return
 	}
 
-	repo, err := models.ForkRepository(ctxUser, forkRepo, form.RepoName, form.Description)
+	// Cannot fork to same owner
+	if ctxUser.ID == baseRepo.OwnerID {
+		ctx.RenderWithErr(ctx.Tr("repo.settings.cannot_fork_to_same_owner"), FORK, &f)
+		return
+	}
+
+	repo, err := models.ForkRepository(ctx.User, ctxUser, baseRepo, f.RepoName, f.Description)
 	if err != nil {
 		ctx.Data["Err_RepoName"] = true
 		switch {
 		case models.IsErrRepoAlreadyExist(err):
-			ctx.RenderWithErr(ctx.Tr("repo.settings.new_owner_has_same_repo"), FORK, &form)
+			ctx.RenderWithErr(ctx.Tr("repo.settings.new_owner_has_same_repo"), FORK, &f)
 		case models.IsErrNameReserved(err):
-			ctx.RenderWithErr(ctx.Tr("repo.form.name_reserved", err.(models.ErrNameReserved).Name), FORK, &form)
+			ctx.RenderWithErr(ctx.Tr("repo.form.name_reserved", err.(models.ErrNameReserved).Name), FORK, &f)
 		case models.IsErrNamePatternNotAllowed(err):
-			ctx.RenderWithErr(ctx.Tr("repo.form.name_pattern_not_allowed", err.(models.ErrNamePatternNotAllowed).Pattern), FORK, &form)
+			ctx.RenderWithErr(ctx.Tr("repo.form.name_pattern_not_allowed", err.(models.ErrNamePatternNotAllowed).Pattern), FORK, &f)
 		default:
 			ctx.Handle(500, "ForkPost", err)
 		}
 		return
 	}
 
-	log.Trace("Repository forked[%d]: %s/%s", forkRepo.ID, ctxUser.Name, repo.Name)
-	ctx.Redirect(setting.AppSubUrl + "/" + ctxUser.Name + "/" + repo.Name)
+	log.Trace("Repository forked from '%s' -> '%s'", baseRepo.FullName(), repo.FullName())
+	ctx.Redirect(repo.Link())
 }
 
-func checkPullInfo(ctx *middleware.Context) *models.Issue {
+func checkPullInfo(ctx *context.Context) *models.Issue {
 	issue, err := models.GetIssueByIndex(ctx.Repo.Repository.ID, ctx.ParamsInt64(":index"))
 	if err != nil {
-		if models.IsErrIssueNotExist(err) {
-			ctx.Handle(404, "GetIssueByIndex", err)
-		} else {
-			ctx.Handle(500, "GetIssueByIndex", err)
-		}
+		ctx.NotFoundOrServerError("GetIssueByIndex", errors.IsIssueNotExist, err)
 		return nil
 	}
-	ctx.Data["Title"] = issue.Name
+	ctx.Data["Title"] = issue.Title
 	ctx.Data["Issue"] = issue
 
 	if !issue.IsPull {
@@ -156,20 +153,9 @@ func checkPullInfo(ctx *middleware.Context) *models.Issue {
 		return nil
 	}
 
-	if err = issue.GetPoster(); err != nil {
-		ctx.Handle(500, "GetPoster", err)
-		return nil
-	} else if err = issue.GetPullRequest(); err != nil {
-		ctx.Handle(500, "GetPullRequest", err)
-		return nil
-	} else if err = issue.GetHeadRepo(); err != nil {
-		ctx.Handle(500, "GetHeadRepo", err)
-		return nil
-	}
-
 	if ctx.IsSigned {
 		// Update issue-user.
-		if err = issue.ReadBy(ctx.User.Id); err != nil {
+		if err = issue.ReadBy(ctx.User.ID); err != nil {
 			ctx.Handle(500, "ReadBy", err)
 			return nil
 		}
@@ -178,19 +164,13 @@ func checkPullInfo(ctx *middleware.Context) *models.Issue {
 	return issue
 }
 
-func PrepareMergedViewPullInfo(ctx *middleware.Context, pull *models.Issue) {
+func PrepareMergedViewPullInfo(ctx *context.Context, issue *models.Issue) {
+	pull := issue.PullRequest
 	ctx.Data["HasMerged"] = true
-
-	var err error
-
-	if err = pull.GetMerger(); err != nil {
-		ctx.Handle(500, "GetMerger", err)
-		return
-	}
-
-	ctx.Data["HeadTarget"] = pull.HeadUserName + "/" + pull.HeadBranch
+	ctx.Data["HeadTarget"] = issue.PullRequest.HeadUserName + "/" + pull.HeadBranch
 	ctx.Data["BaseTarget"] = ctx.Repo.Owner.Name + "/" + pull.BaseBranch
 
+	var err error
 	ctx.Data["NumCommits"], err = ctx.Repo.GitRepo.CommitsCountBetween(pull.MergeBase, pull.MergedCommitID)
 	if err != nil {
 		ctx.Handle(500, "Repo.GitRepo.CommitsCountBetween", err)
@@ -203,8 +183,9 @@ func PrepareMergedViewPullInfo(ctx *middleware.Context, pull *models.Issue) {
 	}
 }
 
-func PrepareViewPullInfo(ctx *middleware.Context, pull *models.Issue) *git.PullRequestInfo {
+func PrepareViewPullInfo(ctx *context.Context, issue *models.Issue) *git.PullRequestInfo {
 	repo := ctx.Repo.Repository
+	pull := issue.PullRequest
 
 	ctx.Data["HeadTarget"] = pull.HeadUserName + "/" + pull.HeadBranch
 	ctx.Data["BaseTarget"] = ctx.Repo.Owner.Name + "/" + pull.BaseBranch
@@ -213,11 +194,6 @@ func PrepareViewPullInfo(ctx *middleware.Context, pull *models.Issue) *git.PullR
 		headGitRepo *git.Repository
 		err         error
 	)
-
-	if err = pull.GetHeadRepo(); err != nil {
-		ctx.Handle(500, "GetHeadRepo", err)
-		return nil
-	}
 
 	if pull.HeadRepo != nil {
 		headGitRepo, err = git.OpenRepository(pull.HeadRepo.RepoPath())
@@ -238,6 +214,14 @@ func PrepareViewPullInfo(ctx *middleware.Context, pull *models.Issue) *git.PullR
 	prInfo, err := headGitRepo.GetPullRequestInfo(models.RepoPath(repo.Owner.Name, repo.Name),
 		pull.BaseBranch, pull.HeadBranch)
 	if err != nil {
+		if strings.Contains(err.Error(), "fatal: Not a valid object name") {
+			ctx.Data["IsPullReuqestBroken"] = true
+			ctx.Data["BaseTarget"] = "deleted"
+			ctx.Data["NumCommits"] = 0
+			ctx.Data["NumFiles"] = 0
+			return nil
+		}
+
 		ctx.Handle(500, "GetPullRequestInfo", err)
 		return nil
 	}
@@ -246,19 +230,24 @@ func PrepareViewPullInfo(ctx *middleware.Context, pull *models.Issue) *git.PullR
 	return prInfo
 }
 
-func ViewPullCommits(ctx *middleware.Context) {
+func ViewPullCommits(ctx *context.Context) {
+	ctx.Data["PageIsPullList"] = true
 	ctx.Data["PageIsPullCommits"] = true
 
-	pull := checkPullInfo(ctx)
+	issue := checkPullInfo(ctx)
 	if ctx.Written() {
 		return
 	}
-	ctx.Data["Username"] = pull.HeadUserName
-	ctx.Data["Reponame"] = pull.HeadRepo.Name
+	pull := issue.PullRequest
+
+	if pull.HeadRepo != nil {
+		ctx.Data["Username"] = pull.HeadUserName
+		ctx.Data["Reponame"] = pull.HeadRepo.Name
+	}
 
 	var commits *list.List
 	if pull.HasMerged {
-		PrepareMergedViewPullInfo(ctx, pull)
+		PrepareMergedViewPullInfo(ctx, issue)
 		if ctx.Written() {
 			return
 		}
@@ -279,7 +268,7 @@ func ViewPullCommits(ctx *middleware.Context) {
 		}
 
 	} else {
-		prInfo := PrepareViewPullInfo(ctx, pull)
+		prInfo := PrepareViewPullInfo(ctx, issue)
 		if ctx.Written() {
 			return
 		} else if prInfo == nil {
@@ -291,18 +280,20 @@ func ViewPullCommits(ctx *middleware.Context) {
 
 	commits = models.ValidateCommitsWithEmails(commits)
 	ctx.Data["Commits"] = commits
-	ctx.Data["CommitCount"] = commits.Len()
+	ctx.Data["CommitsCount"] = commits.Len()
 
 	ctx.HTML(200, PULL_COMMITS)
 }
 
-func ViewPullFiles(ctx *middleware.Context) {
+func ViewPullFiles(ctx *context.Context) {
+	ctx.Data["PageIsPullList"] = true
 	ctx.Data["PageIsPullFiles"] = true
 
-	pull := checkPullInfo(ctx)
+	issue := checkPullInfo(ctx)
 	if ctx.Written() {
 		return
 	}
+	pull := issue.PullRequest
 
 	var (
 		diffRepoPath  string
@@ -312,7 +303,7 @@ func ViewPullFiles(ctx *middleware.Context) {
 	)
 
 	if pull.HasMerged {
-		PrepareMergedViewPullInfo(ctx, pull)
+		PrepareMergedViewPullInfo(ctx, issue)
 		if ctx.Written() {
 			return
 		}
@@ -322,7 +313,7 @@ func ViewPullFiles(ctx *middleware.Context) {
 		endCommitID = pull.MergedCommitID
 		gitRepo = ctx.Repo.GitRepo
 	} else {
-		prInfo := PrepareViewPullInfo(ctx, pull)
+		prInfo := PrepareViewPullInfo(ctx, issue)
 		if ctx.Written() {
 			return
 		} else if prInfo == nil {
@@ -351,7 +342,8 @@ func ViewPullFiles(ctx *middleware.Context) {
 	}
 
 	diff, err := models.GetDiffRange(diffRepoPath,
-		startCommitID, endCommitID, setting.Git.MaxGitDiffLines)
+		startCommitID, endCommitID, setting.Git.MaxGitDiffLines,
+		setting.Git.MaxGitDiffLineCharacters, setting.Git.MaxGitDiffFiles)
 	if err != nil {
 		ctx.Handle(500, "GetDiffRange", err)
 		return
@@ -365,19 +357,30 @@ func ViewPullFiles(ctx *middleware.Context) {
 		return
 	}
 
-	headTarget := path.Join(pull.HeadUserName, pull.HeadRepo.Name)
-	ctx.Data["Username"] = pull.HeadUserName
-	ctx.Data["Reponame"] = pull.HeadRepo.Name
-	ctx.Data["IsImageFile"] = commit.IsImageFile
-	ctx.Data["SourcePath"] = setting.AppSubUrl + "/" + path.Join(headTarget, "src", endCommitID)
-	ctx.Data["BeforeSourcePath"] = setting.AppSubUrl + "/" + path.Join(headTarget, "src", startCommitID)
-	ctx.Data["RawPath"] = setting.AppSubUrl + "/" + path.Join(headTarget, "raw", endCommitID)
-	ctx.Data["RequireHighlightJS"] = true
+	setEditorconfigIfExists(ctx)
+	if ctx.Written() {
+		return
+	}
 
+	ctx.Data["IsSplitStyle"] = ctx.Query("style") == "split"
+	ctx.Data["IsImageFile"] = commit.IsImageFile
+
+	// It is possible head repo has been deleted for merged pull requests
+	if pull.HeadRepo != nil {
+		ctx.Data["Username"] = pull.HeadUserName
+		ctx.Data["Reponame"] = pull.HeadRepo.Name
+
+		headTarget := path.Join(pull.HeadUserName, pull.HeadRepo.Name)
+		ctx.Data["SourcePath"] = setting.AppSubUrl + "/" + path.Join(headTarget, "src", endCommitID)
+		ctx.Data["BeforeSourcePath"] = setting.AppSubUrl + "/" + path.Join(headTarget, "src", startCommitID)
+		ctx.Data["RawPath"] = setting.AppSubUrl + "/" + path.Join(headTarget, "raw", endCommitID)
+	}
+
+	ctx.Data["RequireHighlightJS"] = true
 	ctx.HTML(200, PULL_FILES)
 }
 
-func MergePullRequest(ctx *middleware.Context) {
+func MergePullRequest(ctx *context.Context) {
 	issue := checkPullInfo(ctx)
 	if ctx.Written() {
 		return
@@ -389,11 +392,7 @@ func MergePullRequest(ctx *middleware.Context) {
 
 	pr, err := models.GetPullRequestByIssueID(issue.ID)
 	if err != nil {
-		if models.IsErrPullRequestNotExist(err) {
-			ctx.Handle(404, "GetPullRequestByIssueID", nil)
-		} else {
-			ctx.Handle(500, "GetPullRequestByIssueID", err)
-		}
+		ctx.NotFoundOrServerError("GetPullRequestByIssueID", models.IsErrPullRequestNotExist, err)
 		return
 	}
 
@@ -413,7 +412,7 @@ func MergePullRequest(ctx *middleware.Context) {
 	ctx.Redirect(ctx.Repo.RepoLink + "/pulls/" + com.ToStr(pr.Index))
 }
 
-func ParseCompareInfo(ctx *middleware.Context) (*models.User, *models.Repository, *git.Repository, *git.PullRequestInfo, string, string) {
+func ParseCompareInfo(ctx *context.Context) (*models.User, *models.Repository, *git.Repository, *git.PullRequestInfo, string, string) {
 	baseRepo := ctx.Repo.Repository
 
 	// Get compared branches information
@@ -447,14 +446,11 @@ func ParseCompareInfo(ctx *middleware.Context) (*models.User, *models.Repository
 	} else if len(headInfos) == 2 {
 		headUser, err = models.GetUserByName(headInfos[0])
 		if err != nil {
-			if models.IsErrUserNotExist(err) {
-				ctx.Handle(404, "GetUserByName", nil)
-			} else {
-				ctx.Handle(500, "GetUserByName", err)
-			}
+			ctx.NotFoundOrServerError("GetUserByName", errors.IsUserNotExist, err)
 			return nil, nil, nil, nil, "", ""
 		}
 		headBranch = headInfos[1]
+		isSameRepo = headUser.ID == baseRepo.OwnerID
 
 	} else {
 		ctx.Handle(404, "CompareAndPullRequest", nil)
@@ -462,7 +458,7 @@ func ParseCompareInfo(ctx *middleware.Context) (*models.User, *models.Repository
 	}
 	ctx.Data["HeadUser"] = headUser
 	ctx.Data["HeadBranch"] = headBranch
-	ctx.Data["IsBetweenBranches"] = isSameRepo
+	ctx.Repo.PullRequest.SameRepo = isSameRepo
 
 	// Check if base branch is valid.
 	if !ctx.Repo.GitRepo.IsBranchExist(baseBranch) {
@@ -470,24 +466,30 @@ func ParseCompareInfo(ctx *middleware.Context) (*models.User, *models.Repository
 		return nil, nil, nil, nil, "", ""
 	}
 
-	// Check if current user has fork of repository or in the same repository.
-	headRepo, has := models.HasForkedRepo(headUser.Id, baseRepo.ID)
-	if !has && !isSameRepo {
-		log.Trace("ParseCompareInfo[%d]: does not have fork or in same repository", baseRepo.ID)
-		ctx.Handle(404, "ParseCompareInfo", nil)
-		return nil, nil, nil, nil, "", ""
-	}
+	var (
+		headRepo    *models.Repository
+		headGitRepo *git.Repository
+	)
 
-	var headGitRepo *git.Repository
-	if isSameRepo {
-		headRepo = ctx.Repo.Repository
-		headGitRepo = ctx.Repo.GitRepo
-	} else {
+	// In case user included redundant head user name for comparison in same repository,
+	// no need to check the fork relation.
+	if !isSameRepo {
+		var has bool
+		headRepo, has = models.HasForkedRepo(headUser.ID, baseRepo.ID)
+		if !has {
+			log.Trace("ParseCompareInfo[%d]: does not have fork or in same repository", baseRepo.ID)
+			ctx.Handle(404, "ParseCompareInfo", nil)
+			return nil, nil, nil, nil, "", ""
+		}
+
 		headGitRepo, err = git.OpenRepository(models.RepoPath(headUser.Name, headRepo.Name))
 		if err != nil {
 			ctx.Handle(500, "OpenRepository", err)
 			return nil, nil, nil, nil, "", ""
 		}
+	} else {
+		headRepo = ctx.Repo.Repository
+		headGitRepo = ctx.Repo.GitRepo
 	}
 
 	if !ctx.User.IsWriterOfRepo(headRepo) && !ctx.User.IsAdmin {
@@ -520,7 +522,7 @@ func ParseCompareInfo(ctx *middleware.Context) (*models.User, *models.Repository
 }
 
 func PrepareCompareDiff(
-	ctx *middleware.Context,
+	ctx *context.Context,
 	headUser *models.User,
 	headRepo *models.Repository,
 	headGitRepo *git.Repository,
@@ -533,7 +535,7 @@ func PrepareCompareDiff(
 	)
 
 	// Get diff information.
-	ctx.Data["CommitRepoLink"] = headRepo.RepoLink()
+	ctx.Data["CommitRepoLink"] = headRepo.Link()
 
 	headCommitID, err := headGitRepo.GetBranchCommitID(headBranch)
 	if err != nil {
@@ -548,7 +550,8 @@ func PrepareCompareDiff(
 	}
 
 	diff, err := models.GetDiffRange(models.RepoPath(headUser.Name, headRepo.Name),
-		prInfo.MergeBase, headCommitID, setting.Git.MaxGitDiffLines)
+		prInfo.MergeBase, headCommitID, setting.Git.MaxGitDiffLines,
+		setting.Git.MaxGitDiffLineCharacters, setting.Git.MaxGitDiffFiles)
 	if err != nil {
 		ctx.Handle(500, "GetDiffRange", err)
 		return false
@@ -576,7 +579,7 @@ func PrepareCompareDiff(
 	return false
 }
 
-func CompareAndPullRequest(ctx *middleware.Context) {
+func CompareAndPullRequest(ctx *context.Context) {
 	ctx.Data["Title"] = ctx.Tr("repo.pulls.compare_changes")
 	ctx.Data["PageIsComparePull"] = true
 	ctx.Data["IsDiffCompare"] = true
@@ -615,13 +618,20 @@ func CompareAndPullRequest(ctx *middleware.Context) {
 		}
 	}
 
+	setEditorconfigIfExists(ctx)
+	if ctx.Written() {
+		return
+	}
+
+	ctx.Data["IsSplitStyle"] = ctx.Query("style") == "split"
 	ctx.HTML(200, COMPARE_PULL)
 }
 
-func CompareAndPullRequestPost(ctx *middleware.Context, form auth.CreateIssueForm) {
+func CompareAndPullRequestPost(ctx *context.Context, f form.NewIssue) {
 	ctx.Data["Title"] = ctx.Tr("repo.pulls.compare_changes")
 	ctx.Data["PageIsComparePull"] = true
 	ctx.Data["IsDiffCompare"] = true
+	ctx.Data["RequireHighlightJS"] = true
 	renderAttachmentSettings(ctx)
 
 	var (
@@ -634,36 +644,45 @@ func CompareAndPullRequestPost(ctx *middleware.Context, form auth.CreateIssueFor
 		return
 	}
 
+	labelIDs, milestoneID, assigneeID := ValidateRepoMetas(ctx, f)
+	if ctx.Written() {
+		return
+	}
+
+	if setting.AttachmentEnabled {
+		attachments = f.Files
+	}
+
+	if ctx.HasError() {
+		form.Assign(f, ctx.Data)
+
+		// This stage is already stop creating new pull request, so it does not matter if it has
+		// something to compare or not.
+		PrepareCompareDiff(ctx, headUser, headRepo, headGitRepo, prInfo, baseBranch, headBranch)
+		if ctx.Written() {
+			return
+		}
+
+		ctx.HTML(200, COMPARE_PULL)
+		return
+	}
+
 	patch, err := headGitRepo.GetPatch(prInfo.MergeBase, headBranch)
 	if err != nil {
 		ctx.Handle(500, "GetPatch", err)
 		return
 	}
 
-	labelIDs, milestoneID, assigneeID := ValidateRepoMetas(ctx, form)
-	if ctx.Written() {
-		return
-	}
-
-	if setting.AttachmentEnabled {
-		attachments = form.Attachments
-	}
-
-	if ctx.HasError() {
-		ctx.HTML(200, COMPARE_PULL)
-		return
-	}
-
 	pullIssue := &models.Issue{
 		RepoID:      repo.ID,
 		Index:       repo.NextIssueIndex(),
-		Name:        form.Title,
-		PosterID:    ctx.User.Id,
+		Title:       f.Title,
+		PosterID:    ctx.User.ID,
 		Poster:      ctx.User,
 		MilestoneID: milestoneID,
 		AssigneeID:  assigneeID,
 		IsPull:      true,
-		Content:     form.Content,
+		Content:     f.Content,
 	}
 	pullRequest := &models.PullRequest{
 		HeadRepoID:   headRepo.ID,
@@ -676,6 +695,8 @@ func CompareAndPullRequestPost(ctx *middleware.Context, form auth.CreateIssueFor
 		MergeBase:    prInfo.MergeBase,
 		Type:         models.PULL_REQUEST_GOGS,
 	}
+	// FIXME: check error in the case two people send pull request at almost same time, give nice error prompt
+	// instead of 500.
 	if err := models.NewPullRequest(repo, pullIssue, labelIDs, attachments, pullRequest, patch); err != nil {
 		ctx.Handle(500, "NewPullRequest", err)
 		return
@@ -684,21 +705,33 @@ func CompareAndPullRequestPost(ctx *middleware.Context, form auth.CreateIssueFor
 		return
 	}
 
-	notifyWatchersAndMentions(ctx, pullIssue)
-	if ctx.Written() {
-		return
-	}
-
 	log.Trace("Pull request created: %d/%d", repo.ID, pullIssue.ID)
 	ctx.Redirect(ctx.Repo.RepoLink + "/pulls/" + com.ToStr(pullIssue.Index))
 }
 
-func TriggerTask(ctx *middleware.Context) {
+func parseOwnerAndRepo(ctx *context.Context) (*models.User, *models.Repository) {
+	owner, err := models.GetUserByName(ctx.Params(":username"))
+	if err != nil {
+		ctx.NotFoundOrServerError("GetUserByName", errors.IsUserNotExist, err)
+		return nil, nil
+	}
+
+	repo, err := models.GetRepositoryByName(owner.ID, ctx.Params(":reponame"))
+	if err != nil {
+		ctx.NotFoundOrServerError("GetRepositoryByName", errors.IsRepoNotExist, err)
+		return nil, nil
+	}
+
+	return owner, repo
+}
+
+func TriggerTask(ctx *context.Context) {
+	pusherID := ctx.QueryInt64("pusher")
 	branch := ctx.Query("branch")
 	secret := ctx.Query("secret")
-	if len(branch) == 0 || len(secret) == 0 {
+	if len(branch) == 0 || len(secret) == 0 || pusherID <= 0 {
 		ctx.Error(404)
-		log.Trace("TriggerTask: branch or secret is empty")
+		log.Trace("TriggerTask: branch or secret is empty, or pusher ID is not valid")
 		return
 	}
 	owner, repo := parseOwnerAndRepo(ctx)
@@ -711,9 +744,15 @@ func TriggerTask(ctx *middleware.Context) {
 		return
 	}
 
-	log.Trace("TriggerTask [%d].(new request): %s", repo.ID, branch)
+	pusher, err := models.GetUserByID(pusherID)
+	if err != nil {
+		ctx.NotFoundOrServerError("GetUserByID", errors.IsUserNotExist, err)
+		return
+	}
+
+	log.Trace("TriggerTask '%s/%s' by '%s'", repo.Name, branch, pusher.Name)
 
 	go models.HookQueue.Add(repo.ID)
-	go models.AddTestPullRequestTask(repo.ID, branch)
+	go models.AddTestPullRequestTask(pusher, repo.ID, branch, true)
 	ctx.Status(202)
 }

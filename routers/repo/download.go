@@ -11,42 +11,41 @@ import (
 	"github.com/gogits/git-module"
 
 	"github.com/gogits/gogs/modules/base"
-	"github.com/gogits/gogs/modules/middleware"
+	"github.com/gogits/gogs/modules/context"
+	"github.com/gogits/gogs/modules/setting"
 )
 
-func ServeData(ctx *middleware.Context, name string, reader io.Reader) error {
+func ServeData(ctx *context.Context, name string, reader io.Reader) error {
 	buf := make([]byte, 1024)
 	n, _ := reader.Read(buf)
 	if n > 0 {
 		buf = buf[:n]
 	}
 
-	_, isTextFile := base.IsTextFile(buf)
-	if !isTextFile {
-		_, isImageFile := base.IsImageFile(buf)
-		if !isImageFile {
-			ctx.Resp.Header().Set("Content-Disposition", "attachment; filename="+path.Base(ctx.Repo.TreeName))
+	if !base.IsTextFile(buf) {
+		if !base.IsImageFile(buf) {
+			ctx.Resp.Header().Set("Content-Disposition", "attachment; filename=\""+name+"\"")
 			ctx.Resp.Header().Set("Content-Transfer-Encoding", "binary")
 		}
-	} else {
-		ctx.Resp.Header().Set("Content-Type", "text/plain")
+	} else if !setting.Repository.EnableRawFileRenderMode || !ctx.QueryBool("render") {
+		ctx.Resp.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	}
 	ctx.Resp.Write(buf)
 	_, err := io.Copy(ctx.Resp, reader)
 	return err
 }
 
-func ServeBlob(ctx *middleware.Context, blob *git.Blob) error {
+func ServeBlob(ctx *context.Context, blob *git.Blob) error {
 	dataRc, err := blob.Data()
 	if err != nil {
 		return err
 	}
 
-	return ServeData(ctx, ctx.Repo.TreeName, dataRc)
+	return ServeData(ctx, path.Base(ctx.Repo.TreePath), dataRc)
 }
 
-func SingleDownload(ctx *middleware.Context) {
-	blob, err := ctx.Repo.Commit.GetBlobByPath(ctx.Repo.TreeName)
+func SingleDownload(ctx *context.Context) {
+	blob, err := ctx.Repo.Commit.GetBlobByPath(ctx.Repo.TreePath)
 	if err != nil {
 		if git.IsErrNotExist(err) {
 			ctx.Handle(404, "GetBlobByPath", nil)
