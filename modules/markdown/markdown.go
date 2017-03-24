@@ -22,6 +22,11 @@ import (
 	"github.com/gogits/gogs/modules/setting"
 )
 
+const (
+	ISSUE_NAME_STYLE_NUMERIC      = "numeric"
+	ISSUE_NAME_STYLE_ALPHANUMERIC = "alphanumeric"
+)
+
 var Sanitizer = bluemonday.UGCPolicy()
 
 // BuildSanitizer initializes sanitizer with allowed attributes based on settings.
@@ -38,7 +43,7 @@ func BuildSanitizer() {
 	Sanitizer.AllowURLSchemes(setting.Markdown.CustomURLSchemes...)
 }
 
-var validLinksPattern = regexp.MustCompile(`^[a-z][\w-]+://`)
+var validLinksPattern = regexp.MustCompile(`^[a-z][\w-]+://|^mailto:`)
 
 // isLink reports whether link fits valid format.
 func isLink(link []byte) bool {
@@ -48,10 +53,11 @@ func isLink(link []byte) bool {
 // IsMarkdownFile reports whether name looks like a Markdown file
 // based on its extension.
 func IsMarkdownFile(name string) bool {
-	name = strings.ToLower(name)
-	switch filepath.Ext(name) {
-	case ".md", ".markdown", ".mdown", ".mkd":
-		return true
+	extension := strings.ToLower(filepath.Ext(name))
+	for _, ext := range setting.Markdown.FileExtensions {
+		if strings.ToLower(ext) == extension {
+			return true
+		}
 	}
 	return false
 }
@@ -70,7 +76,7 @@ func IsReadmeFile(name string) bool {
 
 var (
 	// MentionPattern matches string that mentions someone, e.g. @Unknwon
-	MentionPattern = regexp.MustCompile(`(\s|^)@[0-9a-zA-Z_\.]+`)
+	MentionPattern = regexp.MustCompile(`(\s|^|\W)@[0-9a-zA-Z-_\.]+`)
 
 	// CommitPattern matches link to certain commit with or without trailing hash,
 	// e.g. https://try.gogs.io/gogs/gogs/commit/d8a994ef243349f321568f9e36d5c3f444b99cae#diff-2
@@ -79,12 +85,29 @@ var (
 	// IssueFullPattern matches link to an issue with or without trailing hash,
 	// e.g. https://try.gogs.io/gogs/gogs/issues/4#issue-685
 	IssueFullPattern = regexp.MustCompile(`(\s|^)https?.*issues/[0-9]+(#+[0-9a-zA-Z-]*)?`)
-	// IssueIndexPattern matches string that references to an issue, e.g. #1287
-	IssueIndexPattern = regexp.MustCompile(`( |^|\()#[0-9]+\b`)
+	// IssueNumericPattern matches string that references to a numeric issue, e.g. #1287
+	IssueNumericPattern = regexp.MustCompile(`( |^|\()#[0-9]+\b`)
+	// IssueAlphanumericPattern matches string that references to an alphanumeric issue, e.g. ABC-1234
+	IssueAlphanumericPattern = regexp.MustCompile(`( |^|\()[A-Z]{1,10}-[1-9][0-9]*\b`)
+	// CrossReferenceIssueNumericPattern matches string that references a numeric issue in a difference repository
+	// e.g. gogits/gogs#12345
+	CrossReferenceIssueNumericPattern = regexp.MustCompile(`( |^)[0-9a-zA-Z-_\.]+/[0-9a-zA-Z-_\.]+#[0-9]+\b`)
 
 	// Sha1CurrentPattern matches string that represents a commit SHA, e.g. d8a994ef243349f321568f9e36d5c3f444b99cae
+	// FIXME: this pattern matches pure numbers as well, right now we do a hack to check in RenderSha1CurrentPattern
+	// by converting string to a number.
 	Sha1CurrentPattern = regexp.MustCompile(`\b[0-9a-f]{40}\b`)
 )
+
+// FindAllMentions matches mention patterns in given content
+// and returns a list of found user names without @ prefix.
+func FindAllMentions(content string) []string {
+	mentions := MentionPattern.FindAllString(content, -1)
+	for i := range mentions {
+		mentions[i] = mentions[i][strings.Index(mentions[i], "@")+1:] // Strip @ character
+	}
+	return mentions
+}
 
 // Renderer is a extended version of underlying render object.
 type Renderer struct {
@@ -113,28 +136,42 @@ func (r *Renderer) AutoLink(out *bytes.Buffer, link []byte, kind int) {
 
 	// Since this method could only possibly serve one link at a time,
 	// we do not need to find all.
-	m := CommitPattern.Find(link)
-	if m != nil {
-		m = bytes.TrimSpace(m)
-		i := strings.Index(string(m), "commit/")
-		j := strings.Index(string(m), "#")
-		if j == -1 {
-			j = len(m)
+	if bytes.HasPrefix(link, []byte(setting.AppUrl)) {
+		m := CommitPattern.Find(link)
+		if m != nil {
+			m = bytes.TrimSpace(m)
+			i := strings.Index(string(m), "commit/")
+			j := strings.Index(string(m), "#")
+			if j == -1 {
+				j = len(m)
+			}
+			out.WriteString(fmt.Sprintf(` <code><a href="%s">%s</a></code>`, m, base.ShortSha(string(m[i+7:j]))))
+			return
 		}
-		out.WriteString(fmt.Sprintf(` <code><a href="%s">%s</a></code>`, m, base.ShortSha(string(m[i+7:j]))))
-		return
-	}
 
-	m = IssueFullPattern.Find(link)
-	if m != nil {
-		m = bytes.TrimSpace(m)
-		i := strings.Index(string(m), "issues/")
-		j := strings.Index(string(m), "#")
-		if j == -1 {
-			j = len(m)
+		m = IssueFullPattern.Find(link)
+		if m != nil {
+			m = bytes.TrimSpace(m)
+			i := strings.Index(string(m), "issues/")
+			j := strings.Index(string(m), "#")
+			if j == -1 {
+				j = len(m)
+			}
+
+			index := string(m[i+7 : j])
+			fullRepoURL := setting.AppUrl + strings.TrimPrefix(r.urlPrefix, "/")
+			var link string
+			if strings.HasPrefix(string(m), fullRepoURL) {
+				// Use a short issue reference if the URL refers to this repository
+				link = fmt.Sprintf(`<a href="%s">#%s</a>`, m, index)
+			} else {
+				// Use a cross-repository issue reference if the URL refers to a different repository
+				repo := string(m[len(setting.AppUrl) : i-1])
+				link = fmt.Sprintf(`<a href="%s">%s#%s</a>`, m, repo, index)
+			}
+			out.WriteString(link)
+			return
 		}
-		out.WriteString(fmt.Sprintf(` <a href="%s">#%s</a>`, m, base.ShortSha(string(m[i+7:j]))))
-		return
 	}
 
 	r.Renderer.AutoLink(out, link, kind)
@@ -155,42 +192,17 @@ func (options *Renderer) ListItem(out *bytes.Buffer, text []byte, flags int) {
 // Note: this section is for purpose of increase performance and
 // reduce memory allocation at runtime since they are constant literals.
 var (
-	svgSuffix         = []byte(".svg")
-	svgSuffixWithMark = []byte(".svg?")
-	spaceBytes        = []byte(" ")
-	spaceEncodedBytes = []byte("%20")
+	pound        = []byte("#")
+	space        = " "
+	spaceEncoded = "%20"
 )
-
-// Image defines how images should be processed to produce corresponding HTML elements.
-func (r *Renderer) Image(out *bytes.Buffer, link []byte, title []byte, alt []byte) {
-	prefix := strings.Replace(r.urlPrefix, "/src/", "/raw/", 1)
-	if len(link) > 0 {
-		if isLink(link) {
-			// External link with .svg suffix usually means CI status.
-			// TODO: define a keyword to allow non-svg images render as external link.
-			if bytes.HasSuffix(link, svgSuffix) || bytes.Contains(link, svgSuffixWithMark) {
-				r.Renderer.Image(out, link, title, alt)
-				return
-			}
-		} else {
-			if link[0] != '/' {
-				prefix += "/"
-			}
-			link = bytes.Replace([]byte((prefix + string(link))), spaceBytes, spaceEncodedBytes, -1)
-			fmt.Println(333, string(link))
-		}
-	}
-
-	out.WriteString(`<a href="`)
-	out.Write(link)
-	out.WriteString(`">`)
-	r.Renderer.Image(out, link, title, alt)
-	out.WriteString("</a>")
-}
 
 // cutoutVerbosePrefix cutouts URL prefix including sub-path to
 // return a clean unified string of request URL path.
 func cutoutVerbosePrefix(prefix string) string {
+	if len(prefix) == 0 || prefix[0] != '/' {
+		return prefix
+	}
 	count := 0
 	for i := 0; i < len(prefix); i++ {
 		if prefix[i] == '/' {
@@ -206,46 +218,73 @@ func cutoutVerbosePrefix(prefix string) string {
 // RenderIssueIndexPattern renders issue indexes to corresponding links.
 func RenderIssueIndexPattern(rawBytes []byte, urlPrefix string, metas map[string]string) []byte {
 	urlPrefix = cutoutVerbosePrefix(urlPrefix)
-	ms := IssueIndexPattern.FindAll(rawBytes, -1)
+
+	pattern := IssueNumericPattern
+	if metas["style"] == ISSUE_NAME_STYLE_ALPHANUMERIC {
+		pattern = IssueAlphanumericPattern
+	}
+
+	ms := pattern.FindAll(rawBytes, -1)
 	for _, m := range ms {
-		var space string
-		if m[0] != '#' {
-			space = string(m[0])
-			m = m[1:]
+		if m[0] == ' ' || m[0] == '(' {
+			m = m[1:] // ignore leading space or opening parentheses
 		}
+		var link string
 		if metas == nil {
-			rawBytes = bytes.Replace(rawBytes, m, []byte(fmt.Sprintf(`%s<a href="%s/issues/%s">%s</a>`,
-				space, urlPrefix, m[1:], m)), 1)
+			link = fmt.Sprintf(`<a href="%s/issues/%s">%s</a>`, urlPrefix, m[1:], m)
 		} else {
 			// Support for external issue tracker
-			metas["index"] = string(m[1:])
-			rawBytes = bytes.Replace(rawBytes, m, []byte(fmt.Sprintf(`%s<a href="%s">%s</a>`,
-				space, com.Expand(metas["format"], metas), m)), 1)
+			if metas["style"] == ISSUE_NAME_STYLE_ALPHANUMERIC {
+				metas["index"] = string(m)
+			} else {
+				metas["index"] = string(m[1:])
+			}
+			link = fmt.Sprintf(`<a href="%s">%s</a>`, com.Expand(metas["format"], metas), m)
 		}
+		rawBytes = bytes.Replace(rawBytes, m, []byte(link), 1)
+	}
+	return rawBytes
+}
+
+// RenderCrossReferenceIssueIndexPattern renders issue indexes from other repositories to corresponding links.
+func RenderCrossReferenceIssueIndexPattern(rawBytes []byte, urlPrefix string, metas map[string]string) []byte {
+	ms := CrossReferenceIssueNumericPattern.FindAll(rawBytes, -1)
+	for _, m := range ms {
+		if m[0] == ' ' || m[0] == '(' {
+			m = m[1:] // ignore leading space or opening parentheses
+		}
+
+		delimIdx := bytes.Index(m, pound)
+		repo := string(m[:delimIdx])
+		index := string(m[delimIdx+1:])
+
+		link := fmt.Sprintf(`<a href="%s%s/issues/%s">%s</a>`, setting.AppUrl, repo, index, m)
+		rawBytes = bytes.Replace(rawBytes, m, []byte(link), 1)
 	}
 	return rawBytes
 }
 
 // RenderSha1CurrentPattern renders SHA1 strings to corresponding links that assumes in the same repository.
 func RenderSha1CurrentPattern(rawBytes []byte, urlPrefix string) []byte {
-	ms := Sha1CurrentPattern.FindAll(rawBytes, -1)
-	for _, m := range ms {
-		rawBytes = bytes.Replace(rawBytes, m, []byte(fmt.Sprintf(
-			`<a href="%s/commit/%s"><code>%s</code></a>`, urlPrefix, m, base.ShortSha(string(m)))), -1)
-	}
-	return rawBytes
+	return []byte(Sha1CurrentPattern.ReplaceAllStringFunc(string(rawBytes[:]), func(m string) string {
+		if com.StrTo(m).MustInt() > 0 {
+			return m
+		}
+		return fmt.Sprintf(`<a href="%s/commit/%s"><code>%s</code></a>`, urlPrefix, m, base.ShortSha(string(m)))
+	}))
 }
 
 // RenderSpecialLink renders mentions, indexes and SHA1 strings to corresponding links.
 func RenderSpecialLink(rawBytes []byte, urlPrefix string, metas map[string]string) []byte {
 	ms := MentionPattern.FindAll(rawBytes, -1)
 	for _, m := range ms {
-		m = bytes.TrimSpace(m)
+		m = m[bytes.Index(m, []byte("@")):]
 		rawBytes = bytes.Replace(rawBytes, m,
 			[]byte(fmt.Sprintf(`<a href="%s/%s">%s</a>`, setting.AppSubUrl, m[1:], m)), -1)
 	}
 
 	rawBytes = RenderIssueIndexPattern(rawBytes, urlPrefix, metas)
+	rawBytes = RenderCrossReferenceIssueIndexPattern(rawBytes, urlPrefix, metas)
 	rawBytes = RenderSha1CurrentPattern(rawBytes, urlPrefix)
 	return rawBytes
 }
@@ -255,6 +294,23 @@ func RenderRaw(body []byte, urlPrefix string) []byte {
 	htmlFlags := 0
 	htmlFlags |= blackfriday.HTML_SKIP_STYLE
 	htmlFlags |= blackfriday.HTML_OMIT_CONTENTS
+
+	if setting.Smartypants.Enabled {
+		htmlFlags |= blackfriday.HTML_USE_SMARTYPANTS
+		if setting.Smartypants.Fractions {
+			htmlFlags |= blackfriday.HTML_SMARTYPANTS_FRACTIONS
+		}
+		if setting.Smartypants.Dashes {
+			htmlFlags |= blackfriday.HTML_SMARTYPANTS_DASHES
+		}
+		if setting.Smartypants.LatexDashes {
+			htmlFlags |= blackfriday.HTML_SMARTYPANTS_LATEX_DASHES
+		}
+		if setting.Smartypants.AngledQuotes {
+			htmlFlags |= blackfriday.HTML_SMARTYPANTS_ANGLED_QUOTES
+		}
+	}
+
 	renderer := &Renderer{
 		Renderer:  blackfriday.HtmlRenderer(htmlFlags, "", ""),
 		urlPrefix: urlPrefix,
@@ -283,14 +339,72 @@ var (
 	rightAngleBracket = []byte(">")
 )
 
-var noEndTags = []string{"img", "input", "br", "hr"}
+var noEndTags = []string{"input", "br", "hr", "img"}
+
+// wrapImgWithLink warps link to standalone <img> tags.
+func wrapImgWithLink(urlPrefix string, buf *bytes.Buffer, token html.Token) {
+	var src, alt string
+	// Extract "src" and "alt" attributes
+	for i := range token.Attr {
+		switch token.Attr[i].Key {
+		case "src":
+			src = token.Attr[i].Val
+		case "alt":
+			alt = token.Attr[i].Val
+		}
+	}
+
+	// Skip in case the "src" is empty
+	if len(src) == 0 {
+		buf.WriteString(token.String())
+		return
+	}
+
+	// Prepend repository base URL for internal links
+	needPrepend := !isLink([]byte(src))
+	if needPrepend {
+		urlPrefix = strings.Replace(urlPrefix, "/src/", "/raw/", 1)
+		if src[0] != '/' {
+			urlPrefix += "/"
+		}
+	}
+
+	buf.WriteString(`<a href="`)
+	if needPrepend {
+		buf.WriteString(urlPrefix)
+		buf.WriteString(src)
+	} else {
+		buf.WriteString(src)
+	}
+	buf.WriteString(`">`)
+
+	if needPrepend {
+		src = strings.Replace(urlPrefix+string(src), " ", "%20", -1)
+		buf.WriteString(`<img src="`)
+		buf.WriteString(src)
+		buf.WriteString(`"`)
+
+		if len(alt) > 0 {
+			buf.WriteString(` alt="`)
+			buf.WriteString(alt)
+			buf.WriteString(`"`)
+		}
+
+		buf.WriteString(`>`)
+
+	} else {
+		buf.WriteString(token.String())
+	}
+
+	buf.WriteString(`</a>`)
+}
 
 // PostProcess treats different types of HTML differently,
 // and only renders special links for plain text blocks.
-func PostProcess(rawHtml []byte, urlPrefix string, metas map[string]string) []byte {
+func PostProcess(rawHTML []byte, urlPrefix string, metas map[string]string) []byte {
 	startTags := make([]string, 0, 5)
-	var buf bytes.Buffer
-	tokenizer := html.NewTokenizer(bytes.NewReader(rawHtml))
+	buf := bytes.NewBuffer(nil)
+	tokenizer := html.NewTokenizer(bytes.NewReader(rawHTML))
 
 OUTER_LOOP:
 	for html.ErrorToken != tokenizer.Next() {
@@ -300,8 +414,14 @@ OUTER_LOOP:
 			buf.Write(RenderSpecialLink([]byte(token.String()), urlPrefix, metas))
 
 		case html.StartTagToken:
-			buf.WriteString(token.String())
 			tagName := token.Data
+
+			if tagName == "img" {
+				wrapImgWithLink(urlPrefix, buf, token)
+				continue OUTER_LOOP
+			}
+
+			buf.WriteString(token.String())
 			// If this is an excluded tag, we skip processing all output until a close tag is encountered.
 			if strings.EqualFold("a", tagName) || strings.EqualFold("code", tagName) || strings.EqualFold("pre", tagName) {
 				stackNum := 1
@@ -311,14 +431,14 @@ OUTER_LOOP:
 					// Copy the token to the output verbatim
 					buf.WriteString(token.String())
 
-					if token.Type == html.StartTagToken {
+					// Stack number doesn't increate for tags without end tags.
+					if token.Type == html.StartTagToken && !com.IsSliceContainsStr(noEndTags, token.Data) {
 						stackNum++
 					}
 
 					// If this is the close tag to the outer-most, we are done
 					if token.Type == html.EndTagToken {
 						stackNum--
-
 						if stackNum <= 0 && strings.EqualFold(tagName, token.Data) {
 							break
 						}
@@ -327,8 +447,8 @@ OUTER_LOOP:
 				continue OUTER_LOOP
 			}
 
-			if !com.IsSliceContainsStr(noEndTags, token.Data) {
-				startTags = append(startTags, token.Data)
+			if !com.IsSliceContainsStr(noEndTags, tagName) {
+				startTags = append(startTags, tagName)
 			}
 
 		case html.EndTagToken:
@@ -352,11 +472,12 @@ OUTER_LOOP:
 
 	// If we are not at the end of the input, then some other parsing error has occurred,
 	// so return the input verbatim.
-	return rawHtml
+	return rawHTML
 }
 
 // Render renders Markdown to HTML with special links.
 func Render(rawBytes []byte, urlPrefix string, metas map[string]string) []byte {
+	urlPrefix = strings.Replace(urlPrefix, space, spaceEncoded, -1)
 	result := RenderRaw(rawBytes, urlPrefix)
 	result = PostProcess(result, urlPrefix, metas)
 	result = Sanitizer.SanitizeBytes(result)

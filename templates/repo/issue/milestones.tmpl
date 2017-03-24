@@ -26,7 +26,7 @@
 		<div class="milestone list">
 			{{range .Milestones}}
 				<li class="item">
-					<i class="octicon octicon-milestone"></i> <a href="{{$.RepoLink}}/issues?state={{$.State}}&milestone={{.ID}}">{{.Name}}</a>
+					<i class="octicon octicon-milestone"></i> <a href="{{$.RepoLink}}/issues?state={{$.State}}&milestone={{.ID}}">{{.Name | Sanitize}}</a>
 					<div class="ui right green progress" data-percent="{{.Completeness}}">
 						<div class="bar" {{if not .Completeness}}style="background-color: transparent"{{end}}>
 							<div class="progress"></div>
@@ -45,8 +45,10 @@
 							{{end}}
 						{{end}}
 						<span class="issue-stats">
-							<i class="octicon octicon-issue-opened"></i> {{$.i18n.Tr "repo.issues.open_tab" .NumOpenIssues}}
-							<i class="octicon octicon-issue-closed"></i> {{$.i18n.Tr "repo.issues.close_tab" .NumClosedIssues}}
+							{{ $openCount := .CountIssues false false}}
+							{{ $closedCount := .CountIssues true false}}
+							<i class="octicon octicon-issue-opened"></i> {{$.i18n.Tr "repo.issues.open_tab" $openCount}}
+							<i class="octicon octicon-issue-closed"></i> {{$.i18n.Tr "repo.issues.close_tab" $closedCount}}
 						</span>
 					</div>
 					{{if $.IsRepositoryWriter}}

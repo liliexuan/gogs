@@ -4,17 +4,20 @@ set -e
 
 # Set temp environment vars
 export GOPATH=/tmp/go
-export PATH=${PATH}:${GOPATH}/bin
+export PATH=/usr/local/go/bin:${PATH}:${GOPATH}/bin
+export GO15VENDOREXPERIMENT=1
 
 # Install build deps
-apk --no-cache --no-progress add --virtual build-deps linux-pam-dev go gcc musl-dev
+apk --no-cache --no-progress add --virtual build-deps build-base linux-pam-dev
 
-# Init go environment to build Gogs
+# Build Gogs
 mkdir -p ${GOPATH}/src/github.com/gogits/
-ln -s /app/gogs/ ${GOPATH}/src/github.com/gogits/gogs
+ln -s /app/gogs/build ${GOPATH}/src/github.com/gogits/gogs
 cd ${GOPATH}/src/github.com/gogits/gogs
-go get -v -tags "sqlite cert pam"
-go build -tags "sqlite cert pam"
+# Needed since git 2.9.3 or 2.9.4
+git config --global http.https://gopkg.in.followRedirects true
+go get -v -tags "sqlite cert pam" ./...
+make build TAGS="sqlite cert pam"
 
 # Cleanup GOPATH
 rm -r $GOPATH

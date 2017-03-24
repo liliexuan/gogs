@@ -6,11 +6,11 @@ package admin
 
 import (
 	"github.com/Unknwon/paginater"
+	log "gopkg.in/clog.v1"
 
 	"github.com/gogits/gogs/models"
 	"github.com/gogits/gogs/modules/base"
-	"github.com/gogits/gogs/modules/log"
-	"github.com/gogits/gogs/modules/middleware"
+	"github.com/gogits/gogs/modules/context"
 	"github.com/gogits/gogs/modules/setting"
 )
 
@@ -18,37 +18,64 @@ const (
 	REPOS base.TplName = "admin/repo/list"
 )
 
-func Repos(ctx *middleware.Context) {
+func Repos(ctx *context.Context) {
 	ctx.Data["Title"] = ctx.Tr("admin.repositories")
 	ctx.Data["PageIsAdmin"] = true
 	ctx.Data["PageIsAdminRepositories"] = true
 
-	total := models.CountRepositories()
 	page := ctx.QueryInt("page")
-	if page <= 1 {
+	if page <= 0 {
 		page = 1
 	}
-	ctx.Data["Page"] = paginater.New(int(total), setting.AdminRepoPagingNum, page, 5)
 
-	repos, err := models.RepositoriesWithUsers(page, setting.AdminRepoPagingNum)
-	if err != nil {
-		ctx.Handle(500, "RepositoriesWithUsers", err)
+	var (
+		repos []*models.Repository
+		count int64
+		err   error
+	)
+
+	keyword := ctx.Query("q")
+	if len(keyword) == 0 {
+		repos, err = models.Repositories(page, setting.UI.Admin.RepoPagingNum)
+		if err != nil {
+			ctx.Handle(500, "Repositories", err)
+			return
+		}
+		count = models.CountRepositories(true)
+	} else {
+		repos, count, err = models.SearchRepositoryByName(&models.SearchRepoOptions{
+			Keyword:  keyword,
+			OrderBy:  "id ASC",
+			Private:  true,
+			Page:     page,
+			PageSize: setting.UI.Admin.RepoPagingNum,
+		})
+		if err != nil {
+			ctx.Handle(500, "SearchRepositoryByName", err)
+			return
+		}
+	}
+	ctx.Data["Keyword"] = keyword
+	ctx.Data["Total"] = count
+	ctx.Data["Page"] = paginater.New(int(count), setting.UI.Admin.RepoPagingNum, page, 5)
+
+	if err = models.RepositoryList(repos).LoadAttributes(); err != nil {
+		ctx.Handle(500, "LoadAttributes", err)
 		return
 	}
 	ctx.Data["Repos"] = repos
 
-	ctx.Data["Total"] = total
 	ctx.HTML(200, REPOS)
 }
 
-func DeleteRepo(ctx *middleware.Context) {
+func DeleteRepo(ctx *context.Context) {
 	repo, err := models.GetRepositoryByID(ctx.QueryInt64("id"))
 	if err != nil {
 		ctx.Handle(500, "GetRepositoryByID", err)
 		return
 	}
 
-	if err := models.DeleteRepository(repo.MustOwner().Id, repo.ID); err != nil {
+	if err := models.DeleteRepository(repo.MustOwner().ID, repo.ID); err != nil {
 		ctx.Handle(500, "DeleteRepository", err)
 		return
 	}
